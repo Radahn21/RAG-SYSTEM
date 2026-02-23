@@ -1,1 +1,2 @@
 AnYTHNG 
+The . gitignore file tells Git which files and folders to ignore (not track). This is useful for keeping log files, temporary files, build artifacts, or personal files out of your repository. Examples of files to ignore: log files, temporary files, hidden files, personal files, OS/editor files, etc.
