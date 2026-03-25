@@ -1,5 +1,6 @@
 # RAG Ingestion Pipeline
-
+## RAG Architecture 
+<img width="2635" height="713" alt="rag-new-2 drawio" src="https://github.com/user-attachments/assets/2ea0852b-b028-483a-97ad-ff0938de493f" />
 
 A complete end-to-end manual vectorization RAG (Retrieval-Augmented Generation) ingestion pipeline for Azure AI Search.
 
