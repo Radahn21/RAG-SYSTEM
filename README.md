@@ -1,5 +1,6 @@
 # RAG Ingestion Pipeline
 
+
 A complete end-to-end manual vectorization RAG (Retrieval-Augmented Generation) ingestion pipeline for Azure AI Search.
 
 ## Features
