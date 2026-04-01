@@ -28,6 +28,7 @@ This project demonstrates a complete document intelligence workflow: ingest PDFs
 - [Evaluation](#evaluation)
 - [Configuration](#configuration)
 - [Key Design Decisions](#key-design-decisions)
+- [Production Readiness Roadmap](#production-readiness-roadmap)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -807,6 +808,137 @@ py eval/run_eval.py --verbose --hybrid # Verbose with hybrid search
 9. **Lazy imports for web startup** — The web app (`web/app.py`) does not import the retrieval stack at module level. The `from ..query import run_query` import happens inside the `/api/query` handler. This means the server starts in < 1 second, and the heavy model loading only happens on the first query.
 
 10. **dotenv override=True** — A debugging lesson: `load_dotenv()` by default does NOT overwrite existing environment variables. If a system-level env var existed, the `.env` file would be silently ignored. We use `override=True` to prevent this.
+
+---
+
+## Production Readiness Roadmap
+
+This section defines every improvement needed to take this pipeline from a working prototype to a production-grade system, organized by pipeline stage.
+
+### 1. Authentication and Identity
+
+| Current State | Production Improvement | Why |
+|---|---|---|
+| `InteractiveBrowserCredential` opens a browser popup | Switch to `ManagedIdentityCredential` for deployed services, `DefaultAzureCredential` for local dev | Browser popups do not work in containers, VMs, or CI. Managed Identity is the standard for deployed Azure workloads — zero secrets, auto-rotated tokens |
+| Single credential chain (browser → device code) | Use `DefaultAzureCredential` which chains: environment → managed identity → Azure CLI → browser | Covers every deployment target (App Service, AKS, local dev, CI pipelines) with one credential |
+| Token refresh is implicit (SDK handles it) | No change needed | Azure Identity SDK auto-refreshes tokens. But add a health check that validates token acquisition on startup |
+| No credential scoping | Add Azure Key Vault for any future secrets (e.g., third-party APIs) | Even though this project is keyless today, production systems often integrate with non-Azure services. Key Vault with RBAC is the right pattern |
+
+### 2. Ingestion Pipeline
+
+| Current State | Production Improvement | Why |
+|---|---|---|
+| Full re-download on every ingest run | Add change detection: compare blob `last_modified` / `etag` against a local manifest or index metadata | Avoids re-processing unchanged files. Critical when the corpus grows to thousands of documents |
+| Sequential blob downloads | Use `asyncio` + `aiohttp` or `azure.storage.blob.aio` for parallel downloads | 10–50x faster on large corpora. Network I/O is the bottleneck, not CPU |
+| No retry logic on blob or search failures | Add exponential backoff with `tenacity` or Azure SDK's built-in retry policies | Transient 429/503 errors are normal in production. Without retries, a single hiccup drops a document |
+| Entire pipeline is one monolithic run | Split into independent stages: download → extract → chunk → embed → upload, with intermediate storage (e.g., JSON lines on disk or a queue) | Allows restarting from any stage after failure. Enables parallel embedding on multiple machines |
+| No duplicate detection in the index | Before upload, query the index by `source_file` and `chunk_id` to check if the document already exists. Use `merge_or_upload_documents()` instead of `upload_documents()` | Prevents duplicate chunks when re-running ingestion. `merge_or_upload` is idempotent |
+| PyPDF2 for PDF extraction | Evaluate `pdfplumber`, `pymupdf` (fitz), or Azure AI Document Intelligence for complex layouts | PyPDF2 works for simple text PDFs but fails on multi-column layouts, tables, headers/footers, and scanned documents |
+| No OCR for image-based PDFs | Add Azure AI Document Intelligence or Tesseract OCR as a fallback when PyPDF2 extracts zero text | Many real-world documents are scanned images. Without OCR, they produce empty chunks |
+| No content hash for changed-file detection | Hash each document's content (`sha256`) and store it in the index metadata. Skip re-embedding if hash matches | Prevents wasted compute when the same file is uploaded with a new timestamp but identical content |
+
+### 3. Chunking
+
+| Current State | Production Improvement | Why |
+|---|---|---|
+| Character-based chunking (1500 chars) | Evaluate token-based chunking using `tiktoken` (already in requirements) | Embedding models have token limits, not character limits. Token-based chunking ensures you never exceed the model's window |
+| Fixed chunk size for all document types | Add document-type-aware chunking: respect section headings in markdown, table boundaries in PDFs | A chunk that splits a table in half produces poor embeddings and confusing retrieval |
+| Single overlap size (200 chars) | Experiment with larger overlaps (300–500 chars) for long-form technical documents | More overlap preserves more context at boundaries. Run eval to measure the recall impact |
+| No metadata enrichment in chunks | Add extracted headings, section titles, and document-level metadata to each chunk | Gives the retriever and LLM richer context. "This chunk is from Section 3.2: Emergency Response" is more useful than just the raw text |
+| Chunks are plain text only | For documents with tables, consider storing a structured representation alongside the text | Tables lose their meaning when flattened to text. A JSON or markdown table in the chunk preserves structure |
+
+### 4. Embeddings
+
+| Current State | Production Improvement | Why |
+|---|---|---|
+| `all-MiniLM-L6-v2` (384-dim) | Evaluate larger models: `all-mpnet-base-v2` (768-dim), `bge-large-en-v1.5` (1024-dim), or `text-embedding-3-large` | Higher-dim models capture more semantic nuance. Run your eval suite before and after to measure the actual gain |
+| CPU inference only (GPU auto-detected but likely unused) | Deploy embedding generation on a GPU machine or use ONNX Runtime for 2–5x CPU speedup | 384-dim MiniLM is fast on CPU, but larger models need GPU or ONNX to stay practical |
+| Batch size fixed at 32 | Profile and tune: larger batches (64–128) on GPU, smaller (8–16) on constrained memory | Optimal batch size depends on hardware. Wrong batch size either wastes GPU or causes OOM |
+| No embedding versioning | Store the model name and version in the index metadata (e.g., a `_metadata` document) | If you change the embedding model, old vectors are incompatible. Versioning tells you when a full re-index is needed |
+| No embedding cache | Cache embeddings on disk keyed by content hash | If the same document is re-ingested, skip embedding generation entirely |
+
+### 5. Search Index
+
+| Current State | Production Improvement | Why |
+|---|---|---|
+| HNSW with `m=4` | Increase to `m=8` or `m=16` for larger corpora (10K+ chunks) | Higher `m` improves recall at the cost of memory. `m=4` is fine for small indexes but may miss relevant results at scale |
+| `efSearch=500` | Tune based on latency budget. Start with 500, reduce to 200–300 if p95 latency is too high | `efSearch` trades recall for speed. Profile with real queries |
+| No scoring profile | Add a scoring profile that boosts `source_file` matches or `created_at` recency | Lets you bias results toward newer documents or specific sources without changing the query |
+| No semantic ranker | Enable Azure AI Search's built-in semantic ranker (L2 reranker) | Microsoft's cloud-side semantic ranker often outperforms local cross-encoders and requires zero code changes |
+| No index aliases | Use index aliases so you can rebuild the index behind an alias and swap atomically | Zero-downtime re-indexing. The production app always points to the alias, never the raw index name |
+| No index backup | Export index contents periodically using the Search REST API | If the index is accidentally deleted or corrupted, you need a recovery path |
+
+### 6. Retrieval
+
+| Current State | Production Improvement | Why |
+|---|---|---|
+| Heuristic-only query transforms | Add LLM-powered query rewriting as an optional layer (use GPT to rephrase the query) | LLM rewrites capture intent better than dictionary lookups. Gate behind a flag and measure latency |
+| Fixed synonym/acronym dictionary | Load the dictionary from a config file or database, not hardcoded in `heuristics.py` | Domain experts can update synonyms without code changes |
+| RRF with fixed `k=60` | Make `k` configurable and experiment with values 20–100 | Optimal `k` depends on result set sizes. Smaller `k` gives more weight to top-ranked documents |
+| Content dedup at 80% word overlap | Add embedding-similarity dedup (cosine > 0.95) as a second pass | Word overlap misses paraphrased duplicates. Embedding similarity catches semantic duplicates |
+| No query caching | Add an in-memory LRU cache (e.g., `functools.lru_cache` or Redis) for repeated queries | In production, many users ask the same or similar questions. Caching avoids redundant embedding + search calls |
+| No request-level timeout | Add a timeout to the search call (Azure SDK supports `timeout` parameter) | Prevents a single slow query from blocking the server indefinitely |
+
+### 7. LLM Integration
+
+| Current State | Production Improvement | Why |
+|---|---|---|
+| No streaming | Add streaming responses via `responses.create(..., stream=True)` and SSE in the web app | Users see the answer token-by-token instead of waiting for the full response. Critical for UX |
+| No conversation history | Add multi-turn support: store conversation context and pass previous turns to the LLM | Single-turn is fine for one-off questions, but users expect follow-up capability in a chat UI |
+| No token counting before sending | Count tokens with `tiktoken` and truncate context if it exceeds the model's window | Prevents silent failures from oversized prompts. The model may truncate or error without explanation |
+| `max_output_tokens=1500` hardcoded | Make this configurable and adaptive: shorter for simple questions, longer for "explain in detail" | A one-line factual answer doesn't need 1500 tokens. A detailed explanation might need more |
+| No fallback model | Add a fallback model (e.g., GPT-4o or a smaller deployment) if the primary model is unavailable | Production systems need resilience. If `gpt-5.3-chat` is down or throttled, fall back gracefully |
+| No rate limiting on the API endpoint | Add rate limiting middleware to FastAPI (e.g., `slowapi`) | Prevents abuse and protects your Foundry quota from being exhausted by a single user |
+| No cost tracking | Log token usage per request and aggregate daily | Foundry usage is metered. Without tracking, you cannot forecast costs or detect anomalies |
+
+### 8. Verification and Evaluation
+
+| Current State | Production Improvement | Why |
+|---|---|---|
+| Word-overlap grounding check | Add semantic similarity (embedding cosine) between answer sentences and source context | Word overlap misses paraphrased grounding. Embedding similarity catches semantic equivalence |
+| 8 golden questions | Expand to 50–100+ questions covering edge cases, multi-hop reasoning, and "I don't know" scenarios | 8 questions is enough to prove the concept. 100+ questions exposes real failure modes |
+| No automated regression testing | Run the eval suite in CI on every commit that changes retrieval or prompt code | Prevents silent quality regressions. A PR that drops recall from 94% to 70% should be caught automatically |
+| No LLM answer evaluation metrics | Add RAGAS, faithfulness score, or LLM-as-judge evaluation | Keyword recall measures retrieval quality. You also need answer quality metrics: faithfulness, relevance, completeness |
+| No human feedback loop | Add a thumbs-up/thumbs-down button in the web UI and store feedback | Human judgment is the ground truth. Aggregate feedback reveals systematic quality issues |
+| No A/B testing framework | Add the ability to run two configurations side-by-side and compare metrics | When you change the embedding model, chunk size, or prompt, you need controlled comparison, not gut feeling |
+
+### 9. Web App and API
+
+| Current State | Production Improvement | Why |
+|---|---|---|
+| No authentication on the web app | Add Entra ID authentication to the web app (e.g., `fastapi-azure-auth` or MSAL) | Anyone who can reach the server can query your index and use your Foundry quota |
+| No CORS configuration | Add explicit CORS origins in FastAPI | Required if the frontend is ever served from a different domain |
+| No request validation beyond Pydantic | Add input sanitization for the `filter_expr` field (OData injection risk) | `filter_expr` is passed directly to Azure AI Search. A malicious filter could extract unintended data |
+| No structured logging | Switch from Python `logging` to structured JSON logging (e.g., `structlog`) | Structured logs are searchable in Azure Monitor, Application Insights, or any log aggregator |
+| No Application Insights | Add the `opencensus-ext-azure` or `opentelemetry` SDK for distributed tracing | Traces every request across blob → search → LLM with latency breakdowns. Essential for production debugging |
+| No health check beyond `/api/health` | Add deep health checks: verify search index connectivity, embedding model loaded, LLM client reachable | A shallow `{"status": "ok"}` hides backend failures. Deep checks catch issues before users do |
+| Single-process Uvicorn | Use `gunicorn` with multiple Uvicorn workers, or deploy behind Azure App Service / AKS | A single process cannot handle concurrent users. Multiple workers are the minimum for production |
+| No HTTPS | Deploy behind a reverse proxy (nginx, Azure Front Door, or App Service) with TLS termination | All production web traffic must be encrypted |
+
+### 10. Deployment and Operations
+
+| Current State | Production Improvement | Why |
+|---|---|---|
+| Run manually from terminal | Containerize with Docker: `Dockerfile` for the web app, separate container for ingestion | Reproducible deployments. Works on any host (App Service, AKS, ACI, local) |
+| No CI/CD | Add GitHub Actions: lint → test → eval → build container → deploy | Automated quality gates prevent broken code from reaching production |
+| No infrastructure as code | Define Azure resources with Bicep or Terraform | Reproducible environments. Spin up staging/production with one command |
+| `.env` file for config | Use Azure App Configuration or Azure Key Vault for runtime config | `.env` files do not belong in production. Centralized config supports rotation, auditing, and multi-environment |
+| No monitoring alerts | Set up Azure Monitor alerts: high error rate, slow responses, low disk space, token quota nearing limit | You need to know when things break before users tell you |
+| No backup/DR strategy | Document the recovery procedure: re-create the index, re-run ingestion from blob storage | Blob storage is the source of truth. If the index is lost, the recovery path must be tested and documented |
+| Single region | Deploy to a second Azure region with Traffic Manager for failover | Single-region deployments have single-region outage risk |
+| No load testing | Run load tests with `locust` or `k6` against the `/api/query` endpoint | Know your system's breaking point before production traffic finds it |
+
+### Priority Order for Implementation
+
+If you are taking this to production, here is the recommended order:
+
+| Priority | Improvements | Effort |
+|---|---|---|
+| **P0 — Do first** | `DefaultAzureCredential`, web app auth, HTTPS, structured logging, input sanitization, deep health checks | Low–Medium |
+| **P1 — Before launch** | Retry logic, change detection in ingestion, token counting, streaming responses, rate limiting, CI/CD, Docker | Medium |
+| **P2 — After launch** | Parallel downloads, expanded eval suite, Application Insights, conversation history, index aliases, cost tracking | Medium |
+| **P3 — Scale phase** | Larger embedding model, semantic ranker, LLM query rewriting, A/B testing, multi-region, load testing, IaC | Medium–High |
+| **P4 — Long-term** | OCR for scanned PDFs, human feedback loop, RAGAS evaluation, embedding cache, document-type-aware chunking | High |
 
 ---
 
